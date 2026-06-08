@@ -1,0 +1,396 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from pathlib import Path
+import csv
+import subprocess
+import shutil
+import sys
+
+SCRIPT_PATH = Path(__file__).resolve()
+PLOTS_DIR = SCRIPT_PATH.parent
+
+COORDS_CMIP5 = PLOTS_DIR / "coords_points.csv"
+COORDS_CMIP6 = PLOTS_DIR / "coords_points_cmip6.csv"
+
+COMBINED_POINTS_OUT = PLOTS_DIR / "coords_points_cmip5_cmip6_combined.csv"
+OLS_SUMMARY = PLOTS_DIR / "ols_summary_cmip5_cmip6.csv"
+
+SCENARIOS = ["rcp26", "rcp45", "rcp85"]
+REGIONS = ["region_1", "region_2", "region_3"]
+
+TMP_DIR = PLOTS_DIR / "tmp_filtered_cmip5_cmip6"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+CMIP5_POINT_COLOR = "#00AA00"   # green
+CMIP5_LINE_COLOR = "#0000FF"    # blue
+CMIP6_POINT_COLOR = "#FFD400"   # saturated yellow
+CMIP6_LINE_COLOR = "#FF7F00"    # orange
+
+SCENARIO_MAP = {
+    "ssp126": "rcp26",
+    "ssp245": "rcp45",
+    "ssp585": "rcp85",
+    "rcp26": "rcp26",
+    "rcp45": "rcp45",
+    "rcp85": "rcp85",
+}
+
+
+def normalize_scenario(s: str) -> str:
+    s = (s or "").strip().lower()
+    return SCENARIO_MAP.get(s, s)
+
+
+def read_points(coords_csv: Path, generation: str):
+    rows = []
+    with coords_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required = {"scenario", "region", "period_norm", "gcm_key_norm", "model_id", "global_deltat", "regional_deltat"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"{coords_csv.name} missing required columns. Have: {reader.fieldnames}")
+
+        for row in reader:
+            scenario = normalize_scenario(row.get("scenario"))
+            region = (row.get("region") or "").strip()
+
+            if scenario not in SCENARIOS:
+                continue
+            if region not in REGIONS:
+                continue
+
+            try:
+                x = float((row.get("global_deltat") or "").strip())
+                y = float((row.get("regional_deltat") or "").strip())
+            except Exception:
+                continue
+
+            rows.append({
+                "generation": generation,
+                "scenario": scenario,
+                "region": region,
+                "period_norm": (row.get("period_norm") or "").strip(),
+                "gcm_key_norm": (row.get("gcm_key_norm") or "").strip(),
+                "model_id": (row.get("model_id") or "").strip(),
+                "global_deltat": x,
+                "regional_deltat": y,
+            })
+    return rows
+
+
+def write_combined_points(rows, out_csv: Path):
+    fieldnames = [
+        "generation", "scenario", "region", "period_norm", "gcm_key_norm",
+        "model_id", "global_deltat", "regional_deltat"
+    ]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            out = dict(row)
+            out["global_deltat"] = f'{out["global_deltat"]:.10f}'
+            out["regional_deltat"] = f'{out["regional_deltat"]:.10f}'
+            w.writerow(out)
+
+
+def count_points(rows):
+    counts = {(s, r, g): 0 for s in SCENARIOS for r in REGIONS for g in ["CMIP5", "CMIP6"]}
+    for row in rows:
+        key = (row["scenario"], row["region"], row["generation"])
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def write_filtered_dat(rows, scenario: str, region: str, generation: str, out_dat: Path) -> int:
+    filtered = [
+        row for row in rows
+        if row["scenario"] == scenario and row["region"] == region and row["generation"] == generation
+    ]
+    with out_dat.open("w", encoding="utf-8") as f:
+        for row in filtered:
+            f.write(f'{row["global_deltat"]:.10f} {row["regional_deltat"]:.10f}\n')
+    return len(filtered)
+
+
+def read_xy_from_dat(data_dat: Path):
+    xs, ys = [], []
+    with data_dat.open("r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            try:
+                xs.append(float(parts[0]))
+                ys.append(float(parts[1]))
+            except Exception:
+                continue
+    return xs, ys
+
+
+def compute_ols(xs, ys):
+    n = len(xs)
+    if n < 2:
+        raise ValueError("Need at least 2 valid points for OLS.")
+
+    xbar = sum(xs) / n
+    ybar = sum(ys) / n
+
+    sxx = sum((x - xbar) ** 2 for x in xs)
+    syy = sum((y - ybar) ** 2 for y in ys)
+    sxy = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
+
+    if sxx == 0:
+        raise ValueError("Cannot compute OLS: all x-values are identical.")
+
+    slope = sxy / sxx
+    intercept = ybar - slope * xbar
+
+    if syy == 0:
+        r_squared = 1.0
+    else:
+        r_squared = (sxy ** 2) / (sxx * syy) if sxx > 0 and syy > 0 else 0.0
+
+    return {
+        "n_points": n,
+        "slope": slope,
+        "intercept": intercept,
+        "x_mean": xbar,
+        "y_mean": ybar,
+        "r_squared": r_squared,
+        "x_min": min(xs),
+        "x_max": max(xs),
+        "y_min": min(ys),
+        "y_max": max(ys),
+    }
+
+
+def run_gnuplot_combined(
+    gnuplot_path: str,
+    data_cmip5: Path,
+    data_cmip6: Path,
+    n_cmip5: int,
+    n_cmip6: int,
+    scenario: str,
+    region: str,
+    out_png: Path,
+    ols_cmip5=None,
+    ols_cmip6=None,
+):
+    plot_parts = []
+
+    if n_cmip5 > 0:
+        plot_parts.append(
+            f"'{data_cmip5.as_posix()}' using 1:2 with points pt 7 ps 1.2 lc rgb '{CMIP5_POINT_COLOR}' title 'CMIP5 points'"
+        )
+
+    if n_cmip6 > 0:
+        plot_parts.append(
+            f"'{data_cmip6.as_posix()}' using 1:2 with points pt 7 ps 1.2 lc rgb '{CMIP6_POINT_COLOR}' title 'CMIP6 points'"
+        )
+
+    if ols_cmip5 is not None:
+        plot_parts.append(
+            f"f5(x) with lines lw 3 lc rgb '{CMIP5_LINE_COLOR}' title 'CMIP5 OLS'"
+        )
+
+    if ols_cmip6 is not None:
+        plot_parts.append(
+            f"f6(x) with lines lw 3 lc rgb '{CMIP6_LINE_COLOR}' title 'CMIP6 OLS'"
+        )
+
+    if not plot_parts:
+        return
+
+    gp = f"""
+set key top left
+set xlabel 'Global ΔT'
+set ylabel 'Regional ΔT'
+set title '{region} — {scenario} (CMIP5 and CMIP6)'
+set terminal pngcairo size 1200,900
+set output '{out_png.as_posix()}'
+set datafile separator whitespace
+set grid
+
+"""
+
+    if ols_cmip5 is not None:
+        gp += f"f5(x) = ({ols_cmip5['slope']})*x + ({ols_cmip5['intercept']})\n"
+    if ols_cmip6 is not None:
+        gp += f"f6(x) = ({ols_cmip6['slope']})*x + ({ols_cmip6['intercept']})\n"
+
+    gp += "plot " + ", \\\n     ".join(plot_parts) + "\n"
+    gp += "set output\n"
+
+    subprocess.run([gnuplot_path], input=gp, text=True, check=True)
+
+
+def write_ols_summary(rows, out_csv: Path):
+    fieldnames = [
+        "scenario",
+        "region",
+
+        "cmip5_n_points",
+        "cmip5_slope",
+        "cmip5_intercept",
+        "cmip5_x_mean",
+        "cmip5_y_mean",
+        "cmip5_r_squared",
+        "cmip5_x_min",
+        "cmip5_x_max",
+        "cmip5_y_min",
+        "cmip5_y_max",
+
+        "cmip6_n_points",
+        "cmip6_slope",
+        "cmip6_intercept",
+        "cmip6_x_mean",
+        "cmip6_y_mean",
+        "cmip6_r_squared",
+        "cmip6_x_min",
+        "cmip6_x_max",
+        "cmip6_y_min",
+        "cmip6_y_max",
+
+        "delta_slope_cmip6_minus_cmip5",
+        "delta_intercept_cmip6_minus_cmip5",
+        "plot_file"
+    ]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def fmt_or_blank(v):
+    if v is None:
+        return ""
+    return f"{v:.10f}"
+
+
+def main():
+    if not COORDS_CMIP5.exists():
+        print(f"ERROR: Missing {COORDS_CMIP5}.")
+        sys.exit(1)
+
+    if not COORDS_CMIP6.exists():
+        print(f"ERROR: Missing {COORDS_CMIP6}. Run the CMIP6 join script first.")
+        sys.exit(1)
+
+    gnuplot = shutil.which("gnuplot")
+    if not gnuplot:
+        print("ERROR: gnuplot not found in PATH.")
+        sys.exit(1)
+
+    rows_cmip5 = read_points(COORDS_CMIP5, "CMIP5")
+    rows_cmip6 = read_points(COORDS_CMIP6, "CMIP6")
+    all_rows = rows_cmip5 + rows_cmip6
+
+    write_combined_points(all_rows, COMBINED_POINTS_OUT)
+
+    counts = count_points(all_rows)
+
+    print("Point counts per (scenario, region, generation):")
+    for s in SCENARIOS:
+        for r in REGIONS:
+            print(f"  {s} / {r} / CMIP5: {counts[(s, r, 'CMIP5')]}")
+            print(f"  {s} / {r} / CMIP6: {counts[(s, r, 'CMIP6')]}")
+
+    summary_rows = []
+
+    for s in SCENARIOS:
+        for r in REGIONS:
+            dat5 = TMP_DIR / f"coords_{r}_{s}_cmip5.dat"
+            dat6 = TMP_DIR / f"coords_{r}_{s}_cmip6.dat"
+
+            n5 = write_filtered_dat(all_rows, s, r, "CMIP5", dat5)
+            n6 = write_filtered_dat(all_rows, s, r, "CMIP6", dat6)
+
+            if n5 == 0 and n6 == 0:
+                print(f"[SKIP] No points for {s}/{r}.")
+                continue
+
+            ols5 = None
+            ols6 = None
+
+            if n5 >= 2:
+                try:
+                    xs5, ys5 = read_xy_from_dat(dat5)
+                    ols5 = compute_ols(xs5, ys5)
+                except Exception as e:
+                    print(f"[WARN] Could not compute CMIP5 OLS for {s}/{r}: {e}")
+
+            if n6 >= 2:
+                try:
+                    xs6, ys6 = read_xy_from_dat(dat6)
+                    ols6 = compute_ols(xs6, ys6)
+                except Exception as e:
+                    print(f"[WARN] Could not compute CMIP6 OLS for {s}/{r}: {e}")
+
+            out_png = PLOTS_DIR / f"scatter_{r}_{s}_CMIP5_CMIP6.png"
+
+            run_gnuplot_combined(
+                gnuplot_path=gnuplot,
+                data_cmip5=dat5,
+                data_cmip6=dat6,
+                n_cmip5=n5,
+                n_cmip6=n6,
+                scenario=s,
+                region=r,
+                out_png=out_png,
+                ols_cmip5=ols5,
+                ols_cmip6=ols6
+            )
+
+            print(f"[DONE] Wrote combined plot -> {out_png}")
+
+            delta_slope = None
+            delta_intercept = None
+            if ols5 is not None and ols6 is not None:
+                delta_slope = ols6["slope"] - ols5["slope"]
+                delta_intercept = ols6["intercept"] - ols5["intercept"]
+
+            summary_rows.append({
+                "scenario": s,
+                "region": r,
+
+                "cmip5_n_points": "" if ols5 is None else ols5["n_points"],
+                "cmip5_slope": fmt_or_blank(None if ols5 is None else ols5["slope"]),
+                "cmip5_intercept": fmt_or_blank(None if ols5 is None else ols5["intercept"]),
+                "cmip5_x_mean": fmt_or_blank(None if ols5 is None else ols5["x_mean"]),
+                "cmip5_y_mean": fmt_or_blank(None if ols5 is None else ols5["y_mean"]),
+                "cmip5_r_squared": fmt_or_blank(None if ols5 is None else ols5["r_squared"]),
+                "cmip5_x_min": fmt_or_blank(None if ols5 is None else ols5["x_min"]),
+                "cmip5_x_max": fmt_or_blank(None if ols5 is None else ols5["x_max"]),
+                "cmip5_y_min": fmt_or_blank(None if ols5 is None else ols5["y_min"]),
+                "cmip5_y_max": fmt_or_blank(None if ols5 is None else ols5["y_max"]),
+
+                "cmip6_n_points": "" if ols6 is None else ols6["n_points"],
+                "cmip6_slope": fmt_or_blank(None if ols6 is None else ols6["slope"]),
+                "cmip6_intercept": fmt_or_blank(None if ols6 is None else ols6["intercept"]),
+                "cmip6_x_mean": fmt_or_blank(None if ols6 is None else ols6["x_mean"]),
+                "cmip6_y_mean": fmt_or_blank(None if ols6 is None else ols6["y_mean"]),
+                "cmip6_r_squared": fmt_or_blank(None if ols6 is None else ols6["r_squared"]),
+                "cmip6_x_min": fmt_or_blank(None if ols6 is None else ols6["x_min"]),
+                "cmip6_x_max": fmt_or_blank(None if ols6 is None else ols6["x_max"]),
+                "cmip6_y_min": fmt_or_blank(None if ols6 is None else ols6["y_min"]),
+                "cmip6_y_max": fmt_or_blank(None if ols6 is None else ols6["y_max"]),
+
+                "delta_slope_cmip6_minus_cmip5": fmt_or_blank(delta_slope),
+                "delta_intercept_cmip6_minus_cmip5": fmt_or_blank(delta_intercept),
+
+                "plot_file": out_png.name,
+            })
+
+    write_ols_summary(summary_rows, OLS_SUMMARY)
+
+    print("[DONE] Combined points saved to:", COMBINED_POINTS_OUT)
+    print("[DONE] OLS summary saved to:", OLS_SUMMARY)
+    print("[INFO] Filtered data files are in:", TMP_DIR)
+    print("[DONE] All combined plots created in:", PLOTS_DIR)
+
+
+if __name__ == "__main__":
+    main()
