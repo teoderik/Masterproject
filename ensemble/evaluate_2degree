@@ -1,0 +1,320 @@
+
+#!/usr/bin/env python3
+import csv
+import math
+import random
+import re
+from pathlib import Path
+from collections import defaultdict
+
+# ============================================================
+# SETTINGS
+# ============================================================
+SEED = 1995
+
+INPUT_DIR = Path("/home/sm_geoho/ensemble_eval/2_degrees/output")
+OUTPUT_DIR = Path("/home/sm_geoho/ensemble_eval/2_degrees/results")
+
+N_REPEATS = 1000
+THRESHOLDS = [0.05, 0.10]
+
+INPUT_FILE_PAT = re.compile(
+    r"^annual_means_2deg_(?P<region>region_[123])_(?P<variable>tas|pr)\.csv$"
+)
+
+REGION_ORDER = {"region_1": 1, "region_2": 2, "region_3": 3}
+VARIABLE_ORDER = {"tas": 1, "pr": 2}
+CRITERION_ORDER = {"mean": 1, "sd": 2, "both": 3}
+
+
+def pooled_mean(values):
+    return sum(values) / len(values)
+
+
+def pooled_sd_population(values):
+    mu = pooled_mean(values)
+    return math.sqrt(sum((x - mu) ** 2 for x in values) / len(values))
+
+
+def rmse(errors):
+    return math.sqrt(sum(e * e for e in errors) / len(errors))
+
+
+def deterministic_case_seed(base_seed, region, variable):
+    case_str = f"{region}|{variable}|2deg"
+    offset = sum((i + 1) * ord(ch) for i, ch in enumerate(case_str))
+    return base_seed + offset
+
+
+def pct_string(k, N):
+    return f"{100.0 * k / N:.2f}"
+
+
+def warning_if_above_half(k, N):
+    return "More than 50% of the sample needed to be used" if k > 0.5 * N else ""
+
+
+def parse_case_from_filename(path):
+    m = INPUT_FILE_PAT.match(path.name)
+    if not m:
+        return None
+    return m.groupdict()
+
+
+def load_case_csv(path):
+    info = parse_case_from_filename(path)
+    if info is None:
+        raise ValueError(f"Unexpected input filename format: {path.name}")
+
+    member_year_values = defaultdict(list)
+
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ensemble_id = row["ensemble_id"]
+            year = int(row["year"])
+            value = float(row["annual_mean"])
+            member_year_values[ensemble_id].append((year, value))
+
+    cleaned = {}
+    for ensemble_id, yv in member_year_values.items():
+        yv_sorted = sorted(yv, key=lambda t: t[0])
+        values = [v for _, v in yv_sorted]
+        cleaned[ensemble_id] = values
+
+    return info["region"], info["variable"], cleaned
+
+
+def evaluate_case(region, variable, member_to_values, n_repeats=N_REPEATS):
+    member_ids = sorted(member_to_values.keys())
+    N = len(member_ids)
+
+    bad_members = [m for m, vals in member_to_values.items() if len(vals) != 30]
+    if bad_members:
+        raise RuntimeError(
+            f"{region}/{variable}: some members do not have exactly 30 annual means. "
+            f"Examples: {bad_members[:5]}"
+        )
+
+    full_values = []
+    for m in member_ids:
+        full_values.extend(member_to_values[m])
+
+    full_mean = pooled_mean(full_values)
+    full_sd = pooled_sd_population(full_values)
+
+    threshold_values = {}
+    for thr in THRESHOLDS:
+        threshold_values[thr] = {
+            "mean": thr * abs(full_mean),
+            "sd": thr * full_sd,
+        }
+
+    rng = random.Random(deterministic_case_seed(SEED, region, variable))
+
+    detailed_rows = []
+    min_k = {thr: {"mean": None, "sd": None, "both": None} for thr in THRESHOLDS}
+
+    for k in range(1, N + 1):
+        mean_errors = []
+        sd_errors = []
+
+        for _ in range(n_repeats):
+            sampled_members = rng.sample(member_ids, k)
+
+            sampled_values = []
+            for m in sampled_members:
+                sampled_values.extend(member_to_values[m])
+
+            sample_mean = pooled_mean(sampled_values)
+            sample_sd = pooled_sd_population(sampled_values)
+
+            mean_errors.append(sample_mean - full_mean)
+            sd_errors.append(sample_sd - full_sd)
+
+        rmse_mean = rmse(mean_errors)
+        rmse_sd = rmse(sd_errors)
+
+        row = {
+            "region": region,
+            "variable": variable,
+            "seed": SEED,
+            "n_repeats": n_repeats,
+            "full_ensemble_size": N,
+            "k": k,
+            "full_mean": f"{full_mean:.10f}",
+            "full_sd": f"{full_sd:.10f}",
+            "rmse_mean": f"{rmse_mean:.10f}",
+            "rmse_sd": f"{rmse_sd:.10f}",
+        }
+
+        for thr in THRESHOLDS:
+            mean_threshold = threshold_values[thr]["mean"]
+            sd_threshold = threshold_values[thr]["sd"]
+
+            mean_met = rmse_mean <= mean_threshold
+            sd_met = rmse_sd <= sd_threshold
+            both_met = mean_met and sd_met
+
+            if min_k[thr]["mean"] is None and mean_met:
+                min_k[thr]["mean"] = k
+            if min_k[thr]["sd"] is None and sd_met:
+                min_k[thr]["sd"] = k
+            if min_k[thr]["both"] is None and both_met:
+                min_k[thr]["both"] = k
+
+            thr_label = str(int(thr * 100))
+            row[f"mean_threshold_{thr_label}pct"] = f"{mean_threshold:.10f}"
+            row[f"sd_threshold_{thr_label}pct"] = f"{sd_threshold:.10f}"
+            row[f"mean_criterion_met_{thr_label}pct"] = int(mean_met)
+            row[f"sd_criterion_met_{thr_label}pct"] = int(sd_met)
+            row[f"both_criteria_met_{thr_label}pct"] = int(both_met)
+
+        detailed_rows.append(row)
+
+    summary_rows = []
+    for thr in THRESHOLDS:
+        thr_label = str(int(thr * 100))
+        for criterion in ["mean", "sd", "both"]:
+            k_val = min_k[thr][criterion]
+
+            if criterion == "mean":
+                threshold_value = threshold_values[thr]["mean"]
+            elif criterion == "sd":
+                threshold_value = threshold_values[thr]["sd"]
+            else:
+                threshold_value = ""
+
+            summary_rows.append(
+                {
+                    "region": region,
+                    "variable": variable,
+                    "seed": SEED,
+                    "n_repeats": n_repeats,
+                    "full_ensemble_size": N,
+                    "full_mean": f"{full_mean:.10f}",
+                    "full_sd": f"{full_sd:.10f}",
+                    "threshold_percent": thr_label,
+                    "criterion": criterion,
+                    "threshold_value": f"{threshold_value:.10f}" if threshold_value != "" else "",
+                    "minimum_acceptable_k": "" if k_val is None else k_val,
+                    "pct_of_full_sample_used": "" if k_val is None else pct_string(k_val, N),
+                    "above_50pct_of_full_sample": "" if k_val is None else int(k_val > 0.5 * N),
+                    "warning_message": "No acceptable k found" if k_val is None else warning_if_above_half(k_val, N),
+                }
+            )
+
+    return detailed_rows, summary_rows
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    input_files = sorted(INPUT_DIR.glob("annual_means_2deg_*.csv"))
+    case_files = [p for p in input_files if parse_case_from_filename(p) is not None]
+
+    if not case_files:
+        raise RuntimeError(f"No 2-degree case files found in {INPUT_DIR}")
+
+    detailed_out = OUTPUT_DIR / "ensemble_evaluation_2deg_rmse_detailed.csv"
+    summary_out = OUTPUT_DIR / "ensemble_evaluation_2deg_rmse_summary.csv"
+
+    all_detailed_rows = []
+    all_summary_rows = []
+
+    print(f"Seed: {SEED}")
+    print(f"Input directory: {INPUT_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Repeats per k: {N_REPEATS}")
+    print(f"Thresholds: {THRESHOLDS}")
+    print(f"Case files found: {len(case_files)}")
+
+    for path in case_files:
+        region, variable, member_to_values = load_case_csv(path)
+
+        print(f"\nEvaluating 2-degree ensemble: {region} | {variable} ...")
+        detailed_rows, summary_rows = evaluate_case(
+            region=region,
+            variable=variable,
+            member_to_values=member_to_values,
+            n_repeats=N_REPEATS,
+        )
+
+        all_detailed_rows.extend(detailed_rows)
+        all_summary_rows.extend(summary_rows)
+
+        row_5_both = next(r for r in summary_rows if r["threshold_percent"] == "5" and r["criterion"] == "both")
+        row_10_both = next(r for r in summary_rows if r["threshold_percent"] == "10" and r["criterion"] == "both")
+
+        print(
+            f"  N = {row_5_both['full_ensemble_size']}, "
+            f"5% both = {row_5_both['minimum_acceptable_k']}, "
+            f"10% both = {row_10_both['minimum_acceptable_k']}"
+        )
+
+    all_summary_rows.sort(
+        key=lambda r: (
+            int(r["threshold_percent"]),
+            REGION_ORDER[r["region"]],
+            VARIABLE_ORDER[r["variable"]],
+            CRITERION_ORDER[r["criterion"]],
+        )
+    )
+
+    detailed_fields = [
+        "region",
+        "variable",
+        "seed",
+        "n_repeats",
+        "full_ensemble_size",
+        "k",
+        "full_mean",
+        "full_sd",
+        "rmse_mean",
+        "rmse_sd",
+        "mean_threshold_5pct",
+        "sd_threshold_5pct",
+        "mean_criterion_met_5pct",
+        "sd_criterion_met_5pct",
+        "both_criteria_met_5pct",
+        "mean_threshold_10pct",
+        "sd_threshold_10pct",
+        "mean_criterion_met_10pct",
+        "sd_criterion_met_10pct",
+        "both_criteria_met_10pct",
+    ]
+
+    with open(detailed_out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=detailed_fields)
+        writer.writeheader()
+        writer.writerows(all_detailed_rows)
+
+    summary_fields = [
+        "region",
+        "variable",
+        "seed",
+        "n_repeats",
+        "full_ensemble_size",
+        "full_mean",
+        "full_sd",
+        "threshold_percent",
+        "criterion",
+        "threshold_value",
+        "minimum_acceptable_k",
+        "pct_of_full_sample_used",
+        "above_50pct_of_full_sample",
+        "warning_message",
+    ]
+
+    with open(summary_out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fields)
+        writer.writeheader()
+        writer.writerows(all_summary_rows)
+
+    print("\nDone.")
+    print(f"Detailed results written to: {detailed_out}")
+    print(f"Summary results written to:  {summary_out}")
+
+
+if __name__ == "__main__":
+    main()
