@@ -1,0 +1,355 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from pathlib import Path
+import csv
+import re
+import sys
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+SCRIPT_PATH = Path(__file__).resolve()
+PLOTS_DIR = SCRIPT_PATH.parent
+
+GLOBAL_IN = PLOTS_DIR / "global_deltat_long_cmip6.csv"
+REGIONAL_IN = PLOTS_DIR / "regional_deltat_long_cmip6.csv"
+
+GLOBAL_OUT = PLOTS_DIR / "global_deltat_long_with_key_cmip6.csv"
+REGIONAL_OUT = PLOTS_DIR / "regional_deltat_long_with_key_cmip6.csv"
+COORDS_OUT = PLOTS_DIR / "coords_points_cmip6.csv"
+
+MAPPING_OUT = PLOTS_DIR / "gcm_name_mapping_cmip6.csv"
+
+AUDIT_REGIONAL_UNMATCHED = PLOTS_DIR / "audit_unmatched_regional_keys_cmip6.csv"
+AUDIT_GLOBAL_UNUSED = PLOTS_DIR / "audit_unused_global_keys_cmip6.csv"
+AUDIT_REGIONAL_UNMAPPED_GCMS = PLOTS_DIR / "audit_unmapped_regional_gcms_cmip6.csv"
+
+# ------------------------------------------------------------
+# Settings
+# ------------------------------------------------------------
+SCENARIO_MAP = {
+    "ssp126": "rcp26",
+    "ssp245": "rcp45",
+    "ssp585": "rcp85",
+    "rcp26": "rcp26",
+    "rcp45": "rcp45",
+    "rcp85": "rcp85",
+}
+
+
+def normalize_period(p: str) -> str:
+    p = (p or "").strip()
+    if p == "2071-last":
+        return "2071-2100"
+    return p
+
+
+def normalize_scenario(s: str) -> str:
+    s = (s or "").strip().lower()
+    return SCENARIO_MAP.get(s, s)
+
+
+def extract_gcm_from_global_model_member(model_member: str) -> str:
+    """
+    Supports strings like:
+      ACCESS-CM2_r10i1p1f1
+      EC-Earth3_r1i1p1f1
+      MPI-ESM1-2-HR_r1i1p1f1
+    """
+    s = (model_member or "").strip()
+    m = re.match(r"^(.*)_r\d+i\d+p\d+(?:f\d+)?(?:_.*)?$", s)
+    if m:
+        return m.group(1)
+    if "_" in s:
+        return s.rsplit("_", 1)[0]
+    return s
+
+
+def extract_gcm_from_regional_model_id(model_id: str) -> str:
+    s = (model_id or "").strip()
+    return s.split("__", 1)[0] if "__" in s else s
+
+
+def build_join_key(scenario: str, gcm_key_norm: str, period_norm: str) -> str:
+    return f"{scenario}::{gcm_key_norm}::{period_norm}"
+
+
+def build_regional_to_global_gcm_map(global_gcms, regional_gcms):
+    """
+    Map regional raw GCM name -> global GCM name using:
+      1) exact match
+      2) suffix match (longest matching global name wins)
+    """
+    global_set = set(global_gcms)
+    mapping = {}
+    unmapped = []
+
+    global_sorted = sorted(global_set, key=len, reverse=True)
+
+    for r in sorted(set(regional_gcms)):
+        if r in global_set:
+            mapping[r] = r
+            continue
+
+        best = None
+        for g in global_sorted:
+            if r.endswith(g):
+                best = g
+                break
+
+        if best is not None:
+            mapping[r] = best
+        else:
+            unmapped.append(r)
+
+    return mapping, unmapped
+
+
+def main():
+    if not GLOBAL_IN.exists():
+        raise FileNotFoundError(f"Missing input: {GLOBAL_IN}")
+    if not REGIONAL_IN.exists():
+        raise FileNotFoundError(f"Missing input: {REGIONAL_IN}")
+
+    # ----------------------------
+    # 1) Read global
+    # ----------------------------
+    global_rows = []
+    global_gcm_raw_set = set()
+
+    with GLOBAL_IN.open("r", newline="", encoding="utf-8") as fin:
+        reader = csv.DictReader(fin)
+        required = {"scenario", "model_member", "period", "global_deltat"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"Global input missing required columns. Have: {reader.fieldnames}")
+
+        for row in reader:
+            scenario = normalize_scenario(row.get("scenario"))
+            model_member = (row.get("model_member") or "").strip()
+            period = (row.get("period") or "").strip()
+            global_deltat = (row.get("global_deltat") or "").strip()
+
+            if scenario not in {"rcp26", "rcp45", "rcp85"}:
+                continue
+
+            gcm_raw = extract_gcm_from_global_model_member(model_member)
+            period_norm = normalize_period(period)
+
+            row["_scenario"] = scenario
+            row["_period_norm"] = period_norm
+            row["_gcm_raw"] = gcm_raw
+            row["_global_deltat"] = global_deltat
+
+            global_gcm_raw_set.add(gcm_raw)
+            global_rows.append(row)
+
+    print(f"[INFO] Read {len(global_rows)} global rows. Unique global GCM names: {len(global_gcm_raw_set)}")
+
+    # ----------------------------
+    # 2) Read regional
+    # ----------------------------
+    regional_rows = []
+    regional_gcm_raw_set = set()
+
+    with REGIONAL_IN.open("r", newline="", encoding="utf-8") as fin:
+        reader = csv.DictReader(fin)
+        required = {"scenario", "region", "model_id", "period", "regional_deltat"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"Regional input missing required columns. Have: {reader.fieldnames}")
+
+        for row in reader:
+            scenario = normalize_scenario(row.get("scenario"))
+            region = (row.get("region") or "").strip()
+            model_id = (row.get("model_id") or "").strip()
+            period = (row.get("period") or "").strip()
+            regional_deltat = (row.get("regional_deltat") or "").strip()
+
+            if scenario not in {"rcp26", "rcp45", "rcp85"}:
+                continue
+
+            gcm_raw = extract_gcm_from_regional_model_id(model_id)
+            period_norm = normalize_period(period)
+
+            row["_scenario"] = scenario
+            row["_region"] = region
+            row["_period_norm"] = period_norm
+            row["_gcm_raw"] = gcm_raw
+            row["_regional_deltat"] = regional_deltat
+
+            regional_gcm_raw_set.add(gcm_raw)
+            regional_rows.append(row)
+
+    print(f"[INFO] Read {len(regional_rows)} regional rows. Unique regional GCM raw names: {len(regional_gcm_raw_set)}")
+
+    # ----------------------------
+    # 3) Mapping
+    # ----------------------------
+    mapping, unmapped_regional_gcms = build_regional_to_global_gcm_map(
+        global_gcms=global_gcm_raw_set,
+        regional_gcms=regional_gcm_raw_set
+    )
+
+    with MAPPING_OUT.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["regional_gcm_raw", "global_gcm_norm"])
+        for r in sorted(mapping.keys()):
+            w.writerow([r, mapping[r]])
+
+    with AUDIT_REGIONAL_UNMAPPED_GCMS.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["regional_gcm_raw_unmapped"])
+        for r in sorted(unmapped_regional_gcms):
+            w.writerow([r])
+
+    print(f"[INFO] Mapped {len(mapping)} regional GCM names -> {MAPPING_OUT}")
+    print(f"[INFO] Unmapped regional GCM names: {len(unmapped_regional_gcms)} -> {AUDIT_REGIONAL_UNMAPPED_GCMS}")
+
+    # ----------------------------
+    # 4) Global lookup + global_with_key
+    # ----------------------------
+    global_lookup = {}
+    global_keys_used = set()
+    global_written = 0
+
+    with GLOBAL_OUT.open("w", newline="", encoding="utf-8") as fout:
+        out_fields = [
+            "scenario", "model_member", "period", "global_deltat",
+            "gcm_key_raw", "gcm_key_norm", "period_norm", "join_key"
+        ]
+        writer = csv.DictWriter(fout, fieldnames=out_fields)
+        writer.writeheader()
+
+        for row in global_rows:
+            scenario = row["_scenario"]
+            period_norm = row["_period_norm"]
+            gcm_raw = row["_gcm_raw"]
+            global_deltat = row["_global_deltat"]
+
+            gcm_norm = gcm_raw
+            join_key = build_join_key(scenario, gcm_norm, period_norm)
+
+            global_lookup.setdefault(join_key, global_deltat)
+
+            writer.writerow({
+                "scenario": scenario,
+                "model_member": row.get("model_member", ""),
+                "period": row.get("period", ""),
+                "global_deltat": row.get("global_deltat", ""),
+                "gcm_key_raw": gcm_raw,
+                "gcm_key_norm": gcm_norm,
+                "period_norm": period_norm,
+                "join_key": join_key
+            })
+            global_written += 1
+
+    print(f"[DONE] Wrote {global_written} global rows with key -> {GLOBAL_OUT}")
+    print(f"[INFO] Global unique join keys: {len(global_lookup)}")
+
+    # ----------------------------
+    # 5) Regional_with_key + coords_points join
+    # ----------------------------
+    coords_written = 0
+    unmatched_regional = []
+    regional_written = 0
+
+    with REGIONAL_OUT.open("w", newline="", encoding="utf-8") as fout_reg, \
+         COORDS_OUT.open("w", newline="", encoding="utf-8") as fout_pts:
+
+        reg_fields = [
+            "scenario", "region", "model_id", "period", "regional_deltat",
+            "gcm_key_raw", "gcm_key_norm", "period_norm", "join_key"
+        ]
+        writer_reg = csv.DictWriter(fout_reg, fieldnames=reg_fields)
+        writer_reg.writeheader()
+
+        pts_fields = [
+            "scenario", "region", "period_norm", "gcm_key_norm", "model_id",
+            "global_deltat", "regional_deltat"
+        ]
+        writer_pts = csv.DictWriter(fout_pts, fieldnames=pts_fields)
+        writer_pts.writeheader()
+
+        for row in regional_rows:
+            scenario = row["_scenario"]
+            region = row["_region"]
+            model_id = row.get("model_id", "")
+            period_norm = row["_period_norm"]
+            gcm_raw = row["_gcm_raw"]
+            reg_dt = row["_regional_deltat"]
+
+            gcm_norm = mapping.get(gcm_raw, "")
+            join_key = build_join_key(scenario, gcm_norm, period_norm) if gcm_norm else ""
+
+            writer_reg.writerow({
+                "scenario": scenario,
+                "region": region,
+                "model_id": row.get("model_id", ""),
+                "period": row.get("period", ""),
+                "regional_deltat": row.get("regional_deltat", ""),
+                "gcm_key_raw": gcm_raw,
+                "gcm_key_norm": gcm_norm,
+                "period_norm": period_norm,
+                "join_key": join_key
+            })
+            regional_written += 1
+
+            x = global_lookup.get(join_key, "") if join_key else ""
+            if x == "":
+                unmatched_regional.append({
+                    "scenario": scenario,
+                    "region": region,
+                    "period_norm": period_norm,
+                    "gcm_key_raw": gcm_raw,
+                    "gcm_key_norm": gcm_norm,
+                    "model_id": model_id,
+                    "join_key": join_key
+                })
+                continue
+
+            global_keys_used.add(join_key)
+            writer_pts.writerow({
+                "scenario": scenario,
+                "region": region,
+                "period_norm": period_norm,
+                "gcm_key_norm": gcm_norm,
+                "model_id": model_id,
+                "global_deltat": x,
+                "regional_deltat": reg_dt
+            })
+            coords_written += 1
+
+    print(f"[DONE] Wrote {regional_written} regional rows with key -> {REGIONAL_OUT}")
+    print(f"[DONE] Wrote {coords_written} coordinate points -> {COORDS_OUT}")
+
+    # ----------------------------
+    # 6) Audits
+    # ----------------------------
+    with AUDIT_REGIONAL_UNMATCHED.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "scenario", "region", "period_norm", "gcm_key_raw", "gcm_key_norm",
+            "model_id", "join_key"
+        ]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in unmatched_regional:
+            w.writerow(r)
+
+    unused_global = sorted(set(global_lookup.keys()) - global_keys_used)
+    with AUDIT_GLOBAL_UNUSED.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["join_key", "global_deltat"])
+        for k in unused_global:
+            w.writerow([k, global_lookup.get(k, "")])
+
+    print(f"[INFO] Unmatched regional rows: {len(unmatched_regional)} -> {AUDIT_REGIONAL_UNMATCHED}")
+    print(f"[INFO] Unused global join keys: {len(unused_global)} -> {AUDIT_GLOBAL_UNUSED}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
