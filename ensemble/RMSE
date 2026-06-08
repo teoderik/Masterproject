@@ -1,0 +1,550 @@
+
+#!/usr/bin/env python3
+"""
+Create ensemble-size RMSE figures using the combined "both" criterion.
+
+This script uses only standard Python modules and gnuplot.
+It does not use pandas, numpy, or matplotlib.
+
+For each region, scenario, and variable, the plotted value is:
+
+    max(rmse_mean / abs(full_mean), rmse_sd / full_sd) * 100
+
+This gives one curve that represents the stricter of the two criteria.
+The curve is below 5% only when both the mean and SD RMSE criteria
+are below 5%. The same applies for 10%.
+
+The script processes:
+1. The original full-ensemble evaluation file:
+   /home/sm_geoho/ensemble_eval/results_rmse/
+   ensemble_evaluation_rmse_detailed.csv
+
+2. All modified-ensemble detailed files:
+   /home/sm_geoho/ensemble_eval/modified_ensemble/
+   *_detailed.csv
+
+Outputs:
+1. Original full-ensemble figures:
+   /home/sm_geoho/ensemble_eval/results_rmse/figures_rmse_both/
+
+2. Modified-ensemble figures:
+   /home/sm_geoho/ensemble_eval/modified_ensemble/
+   figures_rmse_both_<input-file-stem>/
+"""
+
+from pathlib import Path
+import csv
+import subprocess
+
+
+FULL_INPUT_FILE = Path(
+    "/home/sm_geoho/ensemble_eval/results_rmse/"
+    "ensemble_evaluation_rmse_detailed.csv"
+)
+
+FULL_OUTPUT_DIR = Path(
+    "/home/sm_geoho/ensemble_eval/results_rmse/"
+    "figures_rmse_both"
+)
+
+MODIFIED_INPUT_DIR = Path(
+    "/home/sm_geoho/ensemble_eval/modified_ensemble"
+)
+
+
+REQUIRED_COLUMNS = [
+    "region",
+    "scenario",
+    "variable",
+    "k",
+    "full_ensemble_size",
+    "full_mean",
+    "full_sd",
+    "rmse_mean",
+    "rmse_sd",
+    "both_criteria_met_5pct",
+    "both_criteria_met_10pct",
+]
+
+
+REGION_LABELS = {
+    "region_1": "Region 1",
+    "region_2": "Region 2",
+    "region_3": "Region 3",
+}
+
+SCENARIO_LABELS = {
+    "rcp26": "RCP2.6",
+    "rcp45": "RCP4.5",
+    "rcp85": "RCP8.5",
+}
+
+VARIABLE_LABELS = {
+    "tas": "Temperature change",
+    "pr": "Precipitation change",
+}
+
+
+def to_int(value, column_name):
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Could not convert {}={!r} to int.".format(column_name, value)
+        ) from exc
+
+
+def to_float(value, column_name):
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Could not convert {}={!r} to float.".format(column_name, value)
+        ) from exc
+
+
+def safe_name(text):
+    """
+    Make a string safe for directory and file names.
+    """
+    return (
+        text.replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
+
+
+def make_label_from_file(input_file):
+    """
+    Create a readable label from the input filename.
+    """
+    stem = input_file.stem
+
+    if stem == "ensemble_evaluation_rmse_detailed":
+        return "full_ensemble"
+
+    label = stem
+
+    if label.startswith("ensemble_evaluation_"):
+        label = label.replace("ensemble_evaluation_", "", 1)
+
+    if label.endswith("_detailed"):
+        label = label[:-len("_detailed")]
+
+    return label
+
+
+def discover_inputs():
+    """
+    Return a list of input jobs.
+
+    Each job is a dictionary with:
+        input_file
+        output_dir
+        label
+    """
+    jobs = []
+
+    if FULL_INPUT_FILE.exists():
+        jobs.append(
+            {
+                "input_file": FULL_INPUT_FILE,
+                "output_dir": FULL_OUTPUT_DIR,
+                "label": "full_ensemble",
+            }
+        )
+    else:
+        print("Warning: full input file not found:")
+        print(FULL_INPUT_FILE)
+
+    if MODIFIED_INPUT_DIR.exists():
+        modified_files = sorted(MODIFIED_INPUT_DIR.glob("*_detailed.csv"))
+
+        for input_file in modified_files:
+            label = make_label_from_file(input_file)
+
+            output_dir = MODIFIED_INPUT_DIR / (
+                "figures_rmse_both_{}".format(safe_name(label))
+            )
+
+            jobs.append(
+                {
+                    "input_file": input_file,
+                    "output_dir": output_dir,
+                    "label": label,
+                }
+            )
+    else:
+        print("Warning: modified ensemble directory not found:")
+        print(MODIFIED_INPUT_DIR)
+
+    return jobs
+
+
+def read_rows(input_file):
+    rows = []
+
+    with input_file.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+
+        if reader.fieldnames is None:
+            raise ValueError("Input file has no header row: {}".format(input_file))
+
+        missing = [
+            col for col in REQUIRED_COLUMNS
+            if col not in reader.fieldnames
+        ]
+
+        if missing:
+            raise ValueError(
+                "Missing required columns in {}: {}".format(
+                    input_file,
+                    ", ".join(missing),
+                )
+            )
+
+        for row in reader:
+            rows.append(row)
+
+    return rows
+
+
+def group_rows(rows):
+    grouped = {}
+
+    for row in rows:
+        key = (
+            row["region"],
+            row["scenario"],
+            row["variable"],
+        )
+
+        if key not in grouped:
+            grouped[key] = []
+
+        grouped[key].append(row)
+
+    return grouped
+
+
+def first_k_where_met(case_rows, column_name):
+    values = []
+
+    for row in case_rows:
+        if to_int(row[column_name], column_name) == 1:
+            values.append(to_int(row["k"], "k"))
+
+    if not values:
+        return None
+
+    return min(values)
+
+
+def write_case_data(
+    region,
+    scenario,
+    variable,
+    case_rows,
+    data_dir,
+    file_prefix,
+):
+    """
+    Write a whitespace-separated data file for gnuplot.
+
+    Columns:
+        1: k
+        2: both_relative_rmse_pct
+    """
+    case_rows = sorted(case_rows, key=lambda row: to_int(row["k"], "k"))
+
+    data_file = data_dir / "{}_rmse_both_{}_{}_{}.dat".format(
+        file_prefix,
+        region,
+        scenario,
+        variable,
+    )
+
+    y_values = []
+
+    with data_file.open("w") as f:
+        f.write("# k both_relative_rmse_pct\n")
+
+        for row in case_rows:
+            k = to_int(row["k"], "k")
+
+            full_mean = abs(to_float(row["full_mean"], "full_mean"))
+            full_sd = to_float(row["full_sd"], "full_sd")
+            rmse_mean = to_float(row["rmse_mean"], "rmse_mean")
+            rmse_sd = to_float(row["rmse_sd"], "rmse_sd")
+
+            if full_mean == 0:
+                raise ValueError(
+                    "full_mean is zero for {}, {}, {}, k={}.".format(
+                        region, scenario, variable, k
+                    )
+                )
+
+            if full_sd == 0:
+                raise ValueError(
+                    "full_sd is zero for {}, {}, {}, k={}.".format(
+                        region, scenario, variable, k
+                    )
+                )
+
+            rel_mean_pct = (rmse_mean / full_mean) * 100.0
+            rel_sd_pct = (rmse_sd / full_sd) * 100.0
+            both_pct = max(rel_mean_pct, rel_sd_pct)
+
+            y_values.append(both_pct)
+            f.write("{} {:.10f}\n".format(k, both_pct))
+
+    return data_file, y_values
+
+
+def write_gnuplot_script(
+    region,
+    scenario,
+    variable,
+    case_rows,
+    data_file,
+    y_values,
+    output_dir,
+    script_dir,
+    file_prefix,
+    dataset_label,
+):
+    case_rows = sorted(case_rows, key=lambda row: to_int(row["k"], "k"))
+
+    full_ensemble_size = to_int(
+        case_rows[0]["full_ensemble_size"],
+        "full_ensemble_size",
+    )
+
+    k_5pct = first_k_where_met(case_rows, "both_criteria_met_5pct")
+    k_10pct = first_k_where_met(case_rows, "both_criteria_met_10pct")
+
+    region_label = REGION_LABELS.get(region, region)
+    scenario_label = SCENARIO_LABELS.get(scenario, scenario)
+    variable_label = VARIABLE_LABELS.get(variable, variable)
+
+    if dataset_label == "full_ensemble":
+        title = "{}, {}, {}".format(
+            region_label,
+            scenario_label,
+            variable_label,
+        )
+    else:
+        title = "{}, {}, {} ({})".format(
+            region_label,
+            scenario_label,
+            variable_label,
+            dataset_label,
+        )
+
+    output_png = output_dir / "{}_rmse_both_{}_{}_{}.png".format(
+        file_prefix,
+        region,
+        scenario,
+        variable,
+    )
+
+    gnuplot_file = script_dir / "{}_rmse_both_{}_{}_{}.gp".format(
+        file_prefix,
+        region,
+        scenario,
+        variable,
+    )
+
+    y_max = max(y_values)
+
+    # Keep room above threshold labels.
+    y_upper = max(13.0, y_max * 1.08)
+
+    # Label offsets above the threshold lines.
+    threshold_label_offset = 0.65
+    k_label_offset = 0.95
+
+    y_5_label = 5.0 + threshold_label_offset
+    y_10_label = 10.0 + threshold_label_offset
+
+    y_5_k_label = 5.0 + k_label_offset
+    y_10_k_label = 10.0 + k_label_offset
+
+    if y_upper < y_10_k_label + 0.5:
+        y_upper = y_10_k_label + 0.5
+
+    with gnuplot_file.open("w") as f:
+        f.write("set terminal pngcairo size 1200,800 enhanced font 'Arial,18'\n")
+        f.write("set output '{}'\n".format(output_png))
+        f.write("set title '{}'\n".format(title))
+        f.write("set xlabel 'Number of ensemble members used'\n")
+        f.write("set ylabel 'Maximum relative RMSE (%)'\n")
+        f.write("set xrange [1:{}]\n".format(full_ensemble_size))
+        f.write("set yrange [0:{:.6f}]\n".format(y_upper))
+        f.write("set grid\n")
+        f.write("set key outside below\n")
+
+        # Styles
+        f.write("set style line 1 lc rgb 'red' lw 3 pt 7 ps 1.1\n")
+        f.write("set style line 2 lc rgb 'green' dt 2 lw 3\n")
+        f.write("set style line 3 lc rgb 'blue' dt 2 lw 3\n")
+
+        # Horizontal threshold lines only
+        f.write(
+            "set arrow 1 from 1,5 to {},5 nohead linestyle 2\n".format(
+                full_ensemble_size
+            )
+        )
+        f.write(
+            "set arrow 2 from 1,10 to {},10 nohead linestyle 3\n".format(
+                full_ensemble_size
+            )
+        )
+
+        # Threshold labels above the lines.
+        f.write(
+            "set label 1 '5% threshold' at {},{:.3f} right\n".format(
+                full_ensemble_size,
+                y_5_label,
+            )
+        )
+        f.write(
+            "set label 2 '10% threshold' at {},{:.3f} right\n".format(
+                full_ensemble_size,
+                y_10_label,
+            )
+        )
+
+        # k labels above the respective threshold lines.
+        label_number = 3
+
+        if k_5pct is not None:
+            f.write(
+                "set label {} '(k={})' at {},{:.3f} center\n".format(
+                    label_number,
+                    k_5pct,
+                    k_5pct,
+                    y_5_k_label,
+                )
+            )
+            label_number += 1
+
+        if k_10pct is not None:
+            f.write(
+                "set label {} '(k={})' at {},{:.3f} center\n".format(
+                    label_number,
+                    k_10pct,
+                    k_10pct,
+                    y_10_k_label,
+                )
+            )
+            label_number += 1
+
+        f.write(
+            "plot '{}' using 1:2 with linespoints linestyle 1 title 'Both criterion'\n".format(
+                data_file
+            )
+        )
+
+    return gnuplot_file, output_png
+
+
+def run_gnuplot(gnuplot_file):
+    subprocess.run(
+        ["gnuplot", str(gnuplot_file)],
+        check=True,
+    )
+
+
+def process_input_file(input_file, output_dir, dataset_label):
+    """
+    Process one detailed CSV file and create all corresponding figures.
+    """
+    data_dir = output_dir / "plot_data"
+    script_dir = output_dir / "gnuplot_scripts"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+
+    file_prefix = safe_name(make_label_from_file(input_file))
+
+    rows = read_rows(input_file)
+    grouped = group_rows(rows)
+
+    created_pngs = []
+
+    for key in sorted(grouped):
+        region, scenario, variable = key
+        case_rows = grouped[key]
+
+        data_file, y_values = write_case_data(
+            region,
+            scenario,
+            variable,
+            case_rows,
+            data_dir,
+            file_prefix,
+        )
+
+        gnuplot_file, output_png = write_gnuplot_script(
+            region,
+            scenario,
+            variable,
+            case_rows,
+            data_file,
+            y_values,
+            output_dir,
+            script_dir,
+            file_prefix,
+            dataset_label,
+        )
+
+        run_gnuplot(gnuplot_file)
+        created_pngs.append(output_png)
+
+    return created_pngs
+
+
+def main():
+    jobs = discover_inputs()
+
+    if not jobs:
+        raise FileNotFoundError("No detailed ensemble-evaluation files found.")
+
+    all_created_pngs = []
+
+    print("Input files found: {}".format(len(jobs)))
+
+    for job in jobs:
+        input_file = job["input_file"]
+        output_dir = job["output_dir"]
+        label = job["label"]
+
+        print("")
+        print("Processing:")
+        print("  Input:  {}".format(input_file))
+        print("  Output: {}".format(output_dir))
+        print("  Label:  {}".format(label))
+
+        created_pngs = process_input_file(
+            input_file=input_file,
+            output_dir=output_dir,
+            dataset_label=label,
+        )
+
+        print("  Figures created: {}".format(len(created_pngs)))
+
+        all_created_pngs.extend(created_pngs)
+
+    print("")
+    print("Finished creating all RMSE figures.")
+    print("Total number of figures created: {}".format(len(all_created_pngs)))
+
+    for output_png in all_created_pngs:
+        print(output_png)
+
+
+if __name__ == "__main__":
+    main()
