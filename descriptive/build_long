@@ -1,0 +1,476 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from pathlib import Path
+import csv
+import re
+import subprocess
+import math
+
+# ============================================================
+# Build global CMIP6 future-minus-historical baseline deltas
+# for both tas and pr.
+#
+# Input folders:
+#   /nobackup/rossby27/users/sm_stran/exjobb2026/cmip6/cmip6-data/tas
+#   /nobackup/rossby27/users/sm_stran/exjobb2026/cmip6/cmip6-data/pr
+#
+# Outputs:
+#   1) global_delta_long_cmip6.csv
+#        variable, scenario, model_member, period, global_delta
+#   2) global_deltat_long_cmip6.csv
+#        scenario, model_member, period, global_deltat
+#   3) global_deltapr_long_cmip6.csv
+#        scenario, model_member, period, global_deltapr
+#
+# Method:
+#   - group files by variable + GCM + scenario + member
+#   - compute annual global means with CDO fldmean + yearmean
+#   - merge chunked files into one annual series per run
+#   - baseline = 1971-2000
+#   - future periods = 2015-2040, 2041-2070, 2071-end
+#
+# Notes:
+#   - ssp370 is intentionally ignored
+#   - scenario names remain native CMIP6 names
+# ============================================================
+
+BASE_CMIP6_DIR = Path("/nobackup/rossby27/users/sm_stran/exjobb2026/cmip6/cmip6-data")
+SCRIPT_PATH = Path(__file__).resolve()
+OUT_DIR = SCRIPT_PATH.parent
+
+VAR_DIRS = {
+    "tas": BASE_CMIP6_DIR / "tas",
+    "pr": BASE_CMIP6_DIR / "pr",
+}
+
+OUT_ALL = OUT_DIR / "global_delta_long_cmip6.csv"
+OUT_TAS = OUT_DIR / "global_deltat_long_cmip6.csv"
+OUT_PR = OUT_DIR / "global_deltapr_long_cmip6.csv"
+
+AUDIT_BAD_FILENAMES = OUT_DIR / "audit_cmip6_global_bad_filenames.csv"
+AUDIT_GROUPS = OUT_DIR / "audit_cmip6_global_groups.csv"
+AUDIT_MISSING_HISTORICAL = OUT_DIR / "audit_cmip6_global_missing_historical.csv"
+AUDIT_MISSING_BASELINE = OUT_DIR / "audit_cmip6_global_missing_baseline.csv"
+AUDIT_MISSING_FUTURE = OUT_DIR / "audit_cmip6_global_missing_future_period.csv"
+AUDIT_CDO_ERRORS = OUT_DIR / "audit_cmip6_global_cdo_errors.csv"
+AUDIT_MERGE = OUT_DIR / "audit_cmip6_global_merge_groups.csv"
+
+BASELINE_START = 1971
+BASELINE_END = 2000
+
+FUTURE_PERIODS = [
+    (2015, 2040, "2015-2040"),
+    (2041, 2070, "2041-2070"),
+    (2071, None, "2071-end"),
+]
+
+# Intentionally excluding ssp370
+ALLOWED_FUTURE_SCENARIOS = {"ssp126", "ssp245", "ssp585"}
+ALLOWED_VARS = {"tas", "pr"}
+
+RE_FILENAME = re.compile(
+    r"""
+    ^(?P<var>tas|pr)_Amon_
+    (?P<gcm>.+?)_
+    (?P<scenario>historical|ssp\d+(?:-\w+)?)_
+    (?P<member>r\d+i\d+p\d+f\d+)_
+    (?P<start>\d{4}-\d{2})-(?P<end>\d{4}-\d{2})
+    \.nc$
+    """,
+    re.VERBOSE
+)
+
+
+def parse_filename(path: Path):
+    m = RE_FILENAME.match(path.name)
+    if not m:
+        return None
+
+    d = m.groupdict()
+    start_year = int(d["start"][:4])
+    end_year = int(d["end"][:4])
+
+    return {
+        "variable": d["var"],
+        "gcm": d["gcm"],
+        "scenario": d["scenario"],
+        "member": d["member"],
+        "model_member": f'{d["gcm"]}_{d["member"]}',
+        "start_date": d["start"],
+        "end_date": d["end"],
+        "start_year": start_year,
+        "end_year": end_year,
+        "path": path,
+    }
+
+
+def historical_key(meta):
+    return (meta["variable"], meta["gcm"], meta["member"])
+
+
+def future_key(meta):
+    return (meta["variable"], meta["gcm"], meta["scenario"], meta["member"])
+
+
+def run_cmd(cmd):
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({res.returncode}): {' '.join(cmd)}\n"
+            f"STDERR:\n{res.stderr}"
+        )
+    return res.stdout
+
+
+def cdo_global_yearmean_outputtab(nc_path: Path, varname: str):
+    cmd = [
+        "cdo",
+        "-s",
+        "outputtab,date,value",
+        "-fldmean",
+        "-yearmean",
+        f"-selname,{varname}",
+        str(nc_path),
+    ]
+
+    stdout = run_cmd(cmd)
+    annual = {}
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        if line.startswith("#"):
+            continue
+        if "date" in lower and "value" in lower:
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        date_token = parts[0]
+        value_token = parts[-1]
+
+        if len(date_token) < 4 or not date_token[:4].isdigit():
+            continue
+
+        year = int(date_token[:4])
+
+        try:
+            value = float(value_token)
+        except ValueError:
+            continue
+
+        if math.isnan(value):
+            continue
+
+        annual[year] = value
+
+    return annual
+
+
+def merge_chunked_annual_series(file_meta_list, varname, model_member, scenario, cdo_errors, merge_audit_rows):
+    """
+    Merge multiple file chunks belonging to the same logical run.
+
+    Strategy:
+    - sort by start year, then end year
+    - read annual values from each chunk
+    - stitch the yearly values into one combined series
+    - keep the first seen value for each year after chronological sorting
+
+    This lets short consecutive files be combined into a longer series.
+    """
+    combined = {}
+
+    ordered = sorted(
+        file_meta_list,
+        key=lambda m: (m["start_year"], m["end_year"], m["path"].name)
+    )
+
+    merge_audit_rows.append({
+        "variable": varname,
+        "scenario": scenario,
+        "model_member": model_member,
+        "n_files": len(ordered),
+        "files": " | ".join(str(m["path"].name) for m in ordered)
+    })
+
+    for meta in ordered:
+        fp = meta["path"]
+        try:
+            annual = cdo_global_yearmean_outputtab(fp, varname)
+        except Exception as e:
+            cdo_errors.append({
+                "variable": varname,
+                "scenario": scenario,
+                "model_member": model_member,
+                "filepath": str(fp),
+                "stage": "annual_global_mean",
+                "error": str(e),
+            })
+            continue
+
+        for year in sorted(annual.keys()):
+            if year not in combined:
+                combined[year] = annual[year]
+
+    return combined
+
+
+def mean_over_period(annual_dict, start_year, end_year):
+    vals = [annual_dict[y] for y in range(start_year, end_year + 1) if y in annual_dict]
+    if not vals:
+        return None, 0
+    return sum(vals) / len(vals), len(vals)
+
+
+def main():
+    bad_files = []
+    parsed = []
+
+    for var, var_dir in VAR_DIRS.items():
+        if not var_dir.exists():
+            raise FileNotFoundError(f"Missing variable directory: {var_dir}")
+
+        files = sorted(var_dir.glob(f"{var}_Amon_*.nc"))
+        print(f"[INFO] Found {len(files)} {var} files in {var_dir}")
+
+        for fp in files:
+            meta = parse_filename(fp)
+            if meta is None:
+                bad_files.append({
+                    "filename": fp.name,
+                    "filepath": str(fp),
+                    "reason": "Could not parse filename"
+                })
+                continue
+
+            if meta["variable"] not in ALLOWED_VARS:
+                continue
+
+            scen = meta["scenario"]
+            if scen != "historical" and scen not in ALLOWED_FUTURE_SCENARIOS:
+                continue
+
+            parsed.append(meta)
+
+    historical_groups = {}
+    future_groups = {}
+
+    for meta in parsed:
+        if meta["scenario"] == "historical":
+            key = historical_key(meta)
+            historical_groups.setdefault(key, []).append(meta)
+        else:
+            key = future_key(meta)
+            future_groups.setdefault(key, []).append(meta)
+
+    print(f"[INFO] Historical chains = {len(historical_groups)}")
+    print(f"[INFO] Future chains/scenarios = {len(future_groups)}")
+
+    with AUDIT_GROUPS.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["variable", "group_type", "gcm", "scenario", "member", "n_files"])
+        for (var, gcm, member), metas in sorted(historical_groups.items()):
+            w.writerow([var, "historical", gcm, "historical", member, len(metas)])
+        for (var, gcm, scenario, member), metas in sorted(future_groups.items()):
+            w.writerow([var, "future", gcm, scenario, member, len(metas)])
+
+    all_rows = []
+    missing_historical = []
+    missing_baseline = []
+    missing_future = []
+    cdo_errors = []
+    merge_audit_rows = []
+
+    for (var, gcm, scenario, member), fut_meta in sorted(future_groups.items()):
+        hist_meta = historical_groups.get((var, gcm, member))
+        model_member = f"{gcm}_{member}"
+
+        if hist_meta is None:
+            missing_historical.append({
+                "variable": var,
+                "scenario": scenario,
+                "model_member": model_member,
+                "gcm": gcm,
+                "member": member,
+                "reason": "No matching historical files"
+            })
+            continue
+
+        hist_annual = merge_chunked_annual_series(
+            file_meta_list=hist_meta,
+            varname=var,
+            model_member=model_member,
+            scenario="historical",
+            cdo_errors=cdo_errors,
+            merge_audit_rows=merge_audit_rows
+        )
+
+        fut_annual = merge_chunked_annual_series(
+            file_meta_list=fut_meta,
+            varname=var,
+            model_member=model_member,
+            scenario=scenario,
+            cdo_errors=cdo_errors,
+            merge_audit_rows=merge_audit_rows
+        )
+
+        baseline_mean, n_base = mean_over_period(hist_annual, BASELINE_START, BASELINE_END)
+        if baseline_mean is None or n_base == 0:
+            missing_baseline.append({
+                "variable": var,
+                "scenario": scenario,
+                "model_member": model_member,
+                "gcm": gcm,
+                "member": member,
+                "reason": f"No baseline annual means in {BASELINE_START}-{BASELINE_END}"
+            })
+            continue
+
+        if not fut_annual:
+            missing_future.append({
+                "variable": var,
+                "scenario": scenario,
+                "model_member": model_member,
+                "gcm": gcm,
+                "member": member,
+                "period_requested": "all",
+                "reason": "No future annual means found"
+            })
+            continue
+
+        max_future_year = max(fut_annual.keys())
+
+        for p_start, p_end, p_label in FUTURE_PERIODS:
+            actual_end = max_future_year if p_end is None else min(p_end, max_future_year)
+
+            if actual_end < p_start:
+                missing_future.append({
+                    "variable": var,
+                    "scenario": scenario,
+                    "model_member": model_member,
+                    "gcm": gcm,
+                    "member": member,
+                    "period_requested": p_label,
+                    "reason": "Future period not available"
+                })
+                continue
+
+            fut_mean, n_fut = mean_over_period(fut_annual, p_start, actual_end)
+            if fut_mean is None or n_fut == 0:
+                missing_future.append({
+                    "variable": var,
+                    "scenario": scenario,
+                    "model_member": model_member,
+                    "gcm": gcm,
+                    "member": member,
+                    "period_requested": p_label,
+                    "reason": "No annual means in requested period"
+                })
+                continue
+
+            all_rows.append({
+                "variable": var,
+                "scenario": scenario,
+                "model_member": model_member,
+                "period": p_label,
+                "global_delta": f"{(fut_mean - baseline_mean):.10f}"
+            })
+
+    with OUT_ALL.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "period", "global_delta"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in sorted(all_rows, key=lambda r: (r["variable"], r["scenario"], r["model_member"], r["period"])):
+            w.writerow(row)
+
+    with OUT_TAS.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["scenario", "model_member", "period", "global_deltat"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in sorted((r for r in all_rows if r["variable"] == "tas"),
+                          key=lambda r: (r["scenario"], r["model_member"], r["period"])):
+            w.writerow({
+                "scenario": row["scenario"],
+                "model_member": row["model_member"],
+                "period": row["period"],
+                "global_deltat": row["global_delta"]
+            })
+
+    with OUT_PR.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["scenario", "model_member", "period", "global_deltapr"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in sorted((r for r in all_rows if r["variable"] == "pr"),
+                          key=lambda r: (r["scenario"], r["model_member"], r["period"])):
+            w.writerow({
+                "scenario": row["scenario"],
+                "model_member": row["model_member"],
+                "period": row["period"],
+                "global_deltapr": row["global_delta"]
+            })
+
+    with AUDIT_BAD_FILENAMES.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["filename", "filepath", "reason"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in bad_files:
+            w.writerow(row)
+
+    with AUDIT_MISSING_HISTORICAL.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "gcm", "member", "reason"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in missing_historical:
+            w.writerow(row)
+
+    with AUDIT_MISSING_BASELINE.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "gcm", "member", "reason"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in missing_baseline:
+            w.writerow(row)
+
+    with AUDIT_MISSING_FUTURE.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "gcm", "member", "period_requested", "reason"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in missing_future:
+            w.writerow(row)
+
+    with AUDIT_CDO_ERRORS.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "filepath", "stage", "error"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in cdo_errors:
+            w.writerow(row)
+
+    with AUDIT_MERGE.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["variable", "scenario", "model_member", "n_files", "files"]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in merge_audit_rows:
+            w.writerow(row)
+
+    print(f"[DONE] Wrote combined output -> {OUT_ALL}")
+    print(f"[DONE] Wrote tas-only output -> {OUT_TAS}")
+    print(f"[DONE] Wrote pr-only output -> {OUT_PR}")
+    print(f"[INFO] Total rows written: {len(all_rows)}")
+    print(f"[INFO] Bad filenames: {len(bad_files)} -> {AUDIT_BAD_FILENAMES}")
+    print(f"[INFO] Missing historical groups: {len(missing_historical)} -> {AUDIT_MISSING_HISTORICAL}")
+    print(f"[INFO] Missing baseline cases: {len(missing_baseline)} -> {AUDIT_MISSING_BASELINE}")
+    print(f"[INFO] Missing future cases: {len(missing_future)} -> {AUDIT_MISSING_FUTURE}")
+    print(f"[INFO] CDO errors: {len(cdo_errors)} -> {AUDIT_CDO_ERRORS}")
+    print(f"[INFO] Merge audit: {AUDIT_MERGE}")
+    print("[INFO] ssp370 intentionally excluded")
+
+
+if __name__ == "__main__":
+    main()
