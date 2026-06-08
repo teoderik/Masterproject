@@ -1,0 +1,440 @@
+
+#!/usr/bin/env python3
+import argparse
+import csv
+import re
+import subprocess
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+
+# --------------------------------------------------
+# DEFAULT SETTINGS
+# --------------------------------------------------
+DEFAULT_OUT_DIR = Path("/home/sm_geoho/ensemble_eval/output")
+DEFAULT_REGION_DIRS = {
+    "region_1": Path("/nobackup/accmls1/proj/pc_climinfo/data/exjobb/region_1/monthly_mean"),
+    "region_2": Path("/nobackup/accmls1/proj/pc_climinfo/data/exjobb/region_2/monthly_mean"),
+    "region_3": Path("/nobackup/accmls1/proj/pc_climinfo/data/exjobb/region_3/monthly_mean"),
+}
+DEFAULT_VARIABLES = ["tas", "pr"]
+DEFAULT_SCENARIOS = ["rcp26", "rcp45", "rcp85"]
+
+BASELINE_START_YEAR = 1971
+BASELINE_END_YEAR = 2000
+
+# Example filename:
+# pr_EUR-11_CCCma-CanESM2_historical_r1i1p1_CLMcom-CCLM4-8-17_v1_month_19500101-20051231.nc
+FILE_PAT = re.compile(
+    r"^(?P<variable>tas|pr)_"
+    r"(?P<domain>[^_]+)_"
+    r"(?P<gcm>.+?)_"
+    r"(?P<scenario>historical|rcp26|rcp45|rcp85)_"
+    r"(?P<member>r\d+i\d+p\d+)_"
+    r"(?P<rcm>.+?)_"
+    r"(?P<version>v[0-9A-Za-z]+)_month_"
+    r"(?P<start>\d{8})-(?P<end>\d{8})\.nc$"
+)
+
+
+def run(cmd):
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Command failed (exit {res.returncode}): {' '.join(cmd)}\n\n"
+            f"STDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}"
+        )
+    return res.stdout
+
+
+def parse_file(p: Path):
+    m = FILE_PAT.match(p.name)
+    if not m:
+        return None
+
+    d = m.groupdict()
+    start_year = int(d["start"][:4])
+    end_year = int(d["end"][:4])
+
+    # Keep the same ensemble definition as before:
+    # one regional chain = gcm + member + rcm
+    ensemble_id = f'{d["gcm"]}_{d["member"]}_{d["rcm"]}'
+
+    return {
+        "path": p,
+        "variable": d["variable"],
+        "domain": d["domain"],
+        "gcm": d["gcm"],
+        "scenario": d["scenario"],
+        "member": d["member"],
+        "rcm": d["rcm"],
+        "version": d["version"],
+        "ensemble_id": ensemble_id,
+        "start_year": start_year,
+        "end_year": end_year,
+    }
+
+
+def covers_years(file_meta, req_start, req_end):
+    return file_meta["start_year"] <= req_start and file_meta["end_year"] >= req_end
+
+
+def pick_best_single_file(files_meta, req_start, req_end):
+    candidates = [m for m in files_meta if covers_years(m, req_start, req_end)]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda m: ((m["end_year"] - m["start_year"]), m["end_year"]),
+        reverse=True,
+    )
+    return candidates[0]["path"]
+
+
+def mergetime_to_tmp(paths, tmpdir: Path, tag: str) -> Path:
+    out = tmpdir / f"{tag}.nc"
+    cmd = ["cdo", "-s", "mergetime"] + [str(p) for p in paths] + [str(out)]
+    run(cmd)
+    return out
+
+
+def select_or_merge(files_meta, tmpdir: Path, tag: str, req_start: int, req_end: int) -> Path:
+    """
+    If one file covers the requested period, use it.
+    Otherwise merge a sequential set of files that together cover the period.
+    """
+    single = pick_best_single_file(files_meta, req_start, req_end)
+    if single is not None:
+        return single
+
+    files_sorted = sorted(files_meta, key=lambda m: (m["start_year"], m["end_year"]))
+    chosen = []
+    current_start = None
+    current_end = -10**9
+
+    for m in files_sorted:
+        if not chosen:
+            chosen.append(m)
+            current_start = m["start_year"]
+            current_end = m["end_year"]
+            if current_start <= req_start and current_end >= req_end:
+                break
+            continue
+
+        if m["start_year"] <= current_end + 1 and m["end_year"] > current_end:
+            chosen.append(m)
+            current_end = m["end_year"]
+            if current_start <= req_start and current_end >= req_end:
+                break
+
+    if current_start is None or not (current_start <= req_start and current_end >= req_end):
+        raise RuntimeError(
+            f"Cannot find single file or mergeable set covering {req_start}-{req_end}. "
+            f"Best coverage found: {current_start}-{current_end}."
+        )
+
+    return mergetime_to_tmp([m["path"] for m in chosen], tmpdir, tag)
+
+
+def compute_period_mean(nc_path: Path, variable: str, req_start: int, req_end: int):
+    """
+    Compute one mean over the full requested period.
+    This is used for the historical 1971-2000 baseline.
+    """
+    cmd = [
+        "cdo",
+        "-s",
+        "outputtab,value",
+        "-timmean",
+        "-fldmean",
+        f"-selname,{variable}",
+        f"-seldate,{req_start}-01-01,{req_end}-12-31",
+        str(nc_path),
+    ]
+    out = run(cmd)
+
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", out)
+    if not nums:
+        raise RuntimeError(f"Could not parse period mean from CDO output:\n{out}")
+
+    return float(nums[-1])
+
+
+def extract_last30_yearly_means(nc_path: Path, variable: str, req_start: int, req_end: int):
+    """
+    Extract annual means for each year in the requested window.
+    Returns a list of (year, annual_mean) with exactly 30 entries if successful.
+    """
+    cmd = [
+        "cdo",
+        "-s",
+        "outputtab,date,value",
+        "-yearmean",
+        "-fldmean",
+        f"-selname,{variable}",
+        f"-seldate,{req_start}-01-01,{req_end}-12-31",
+        str(nc_path),
+    ]
+    out = run(cmd)
+
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("date"):
+            continue
+
+        parts = re.split(r"\s+", line)
+        if len(parts) < 2:
+            continue
+
+        date_str = parts[0]
+        value_str = parts[-1]
+
+        year_match = re.search(r"(\d{4})", date_str)
+        if year_match is None:
+            continue
+
+        year = int(year_match.group(1))
+        if req_start <= year <= req_end:
+            rows.append((year, float(value_str)))
+
+    # Remove duplicates by year if they appear
+    year_to_value = {}
+    for year, value in rows:
+        year_to_value[year] = value
+
+    rows = sorted(year_to_value.items())
+
+    expected_years = list(range(req_start, req_end + 1))
+    got_years = [y for y, _ in rows]
+
+    if got_years != expected_years:
+        raise RuntimeError(
+            f"Expected years {expected_years[0]}-{expected_years[-1]} "
+            f"({len(expected_years)} years), got {got_years}"
+        )
+
+    return rows
+
+
+def discover_case_files(region_dir: Path, variable: str, scenario: str):
+    discovered = []
+    for p in sorted(region_dir.glob("*.nc")):
+        meta = parse_file(p)
+        if meta is None:
+            continue
+        if meta["variable"] != variable:
+            continue
+        if meta["scenario"] != scenario:
+            continue
+        discovered.append(meta)
+    return discovered
+
+
+def grouped_by_ensemble(files_meta):
+    groups = defaultdict(list)
+    for m in files_meta:
+        groups[m["ensemble_id"]].append(m)
+    return groups
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=(
+            "Extract the last 30 annual mean anomalies for each regional ensemble member, "
+            "where anomalies are computed relative to the member-specific historical "
+            "1971-2000 mean."
+        )
+    )
+    ap.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    ap.add_argument("--variables", nargs="+", default=DEFAULT_VARIABLES, choices=DEFAULT_VARIABLES)
+    ap.add_argument("--scenarios", nargs="+", default=DEFAULT_SCENARIOS, choices=DEFAULT_SCENARIOS)
+    ap.add_argument(
+        "--regions",
+        nargs="+",
+        default=list(DEFAULT_REGION_DIRS.keys()),
+        choices=list(DEFAULT_REGION_DIRS.keys()),
+    )
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_csv = out_dir / "extraction_summary.csv"
+
+    summary_rows = []
+
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+
+        for region in args.regions:
+            region_dir = DEFAULT_REGION_DIRS[region]
+            if not region_dir.exists():
+                raise RuntimeError(f"Region directory does not exist: {region_dir}")
+
+            for variable in args.variables:
+                # Discover historical files once per region-variable
+                hist_files_meta = discover_case_files(region_dir, variable, "historical")
+                hist_groups = grouped_by_ensemble(hist_files_meta)
+
+                for scenario in args.scenarios:
+                    fut_files_meta = discover_case_files(region_dir, variable, scenario)
+                    if not fut_files_meta:
+                        print(f"[{region} | {variable} | {scenario}] No files found. Skipping.")
+                        continue
+
+                    fut_groups = grouped_by_ensemble(fut_files_meta)
+                    out_csv = out_dir / f"annual_means_{region}_{scenario}_{variable}.csv"
+
+                    n_written_members = 0
+                    n_failed_members = 0
+                    total_rows = 0
+
+                    with open(out_csv, "w", newline="") as f:
+                        writer = csv.DictWriter(
+                            f,
+                            fieldnames=[
+                                "region",
+                                "scenario",
+                                "variable",
+                                "ensemble_id",
+                                "gcm",
+                                "member",
+                                "rcm",
+                                "year",
+                                "annual_mean",          # anomaly value, kept same column name for compatibility
+                                "baseline_mean_1971_2000",
+                                "window_start_year",
+                                "window_end_year",
+                                "historical_source_path",
+                                "future_source_path",
+                            ],
+                        )
+                        writer.writeheader()
+
+                        for ensemble_id, fut_member_files in sorted(fut_groups.items()):
+                            example_meta = fut_member_files[0]
+
+                            # Find matching historical member
+                            hist_member_files = hist_groups.get(ensemble_id)
+                            if not hist_member_files:
+                                n_failed_members += 1
+                                print(f"[{region} | {variable} | {scenario}] Failed {ensemble_id}")
+                                print("  error: No matching historical files found for this future member.")
+                                continue
+
+                            # Future window: last 30 years of available future data
+                            max_end = max(m["end_year"] for m in fut_member_files)
+                            window_end = max_end
+                            window_start = window_end - 29
+
+                            try:
+                                # Historical source covering 1971-2000
+                                hist_src = select_or_merge(
+                                    hist_member_files,
+                                    tmpdir,
+                                    tag=re.sub(
+                                        r"[^A-Za-z0-9_.-]",
+                                        "_",
+                                        f"{region}_historical_{variable}_{ensemble_id}",
+                                    ),
+                                    req_start=BASELINE_START_YEAR,
+                                    req_end=BASELINE_END_YEAR,
+                                )
+
+                                baseline_mean = compute_period_mean(
+                                    hist_src,
+                                    variable,
+                                    BASELINE_START_YEAR,
+                                    BASELINE_END_YEAR,
+                                )
+
+                                # Future source covering the last 30 years
+                                fut_src = select_or_merge(
+                                    fut_member_files,
+                                    tmpdir,
+                                    tag=re.sub(
+                                        r"[^A-Za-z0-9_.-]",
+                                        "_",
+                                        f"{region}_{scenario}_{variable}_{ensemble_id}",
+                                    ),
+                                    req_start=window_start,
+                                    req_end=window_end,
+                                )
+
+                                future_annual_rows = extract_last30_yearly_means(
+                                    fut_src, variable, window_start, window_end
+                                )
+
+                            except Exception as e:
+                                n_failed_members += 1
+                                print(f"[{region} | {variable} | {scenario}] Failed {ensemble_id}")
+                                print(f"  future window: {window_start}-{window_end}")
+                                print(f"  future files: {[str(m['path']) for m in fut_member_files]}")
+                                print(f"  historical files: {[str(m['path']) for m in hist_member_files]}")
+                                print(f"  error: {e}")
+                                continue
+
+                            # Write future anomalies = future annual mean - historical 1971-2000 mean
+                            for year, future_value in future_annual_rows:
+                                anomaly_value = future_value - baseline_mean
+                                writer.writerow(
+                                    {
+                                        "region": region,
+                                        "scenario": scenario,
+                                        "variable": variable,
+                                        "ensemble_id": ensemble_id,
+                                        "gcm": example_meta["gcm"],
+                                        "member": example_meta["member"],
+                                        "rcm": example_meta["rcm"],
+                                        "year": year,
+                                        "annual_mean": f"{anomaly_value:.8f}",
+                                        "baseline_mean_1971_2000": f"{baseline_mean:.8f}",
+                                        "window_start_year": window_start,
+                                        "window_end_year": window_end,
+                                        "historical_source_path": str(hist_src),
+                                        "future_source_path": str(fut_src),
+                                    }
+                                )
+                                total_rows += 1
+
+                            n_written_members += 1
+
+                    summary_rows.append(
+                        {
+                            "region": region,
+                            "scenario": scenario,
+                            "variable": variable,
+                            "members_found": len(fut_groups),
+                            "members_written": n_written_members,
+                            "members_failed": n_failed_members,
+                            "rows_written": total_rows,
+                            "output_csv": str(out_csv),
+                        }
+                    )
+
+                    print(
+                        f"[{region} | {variable} | {scenario}] Wrote {total_rows} rows "
+                        f"for {n_written_members} members to {out_csv}"
+                    )
+
+    with open(summary_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "region",
+                "scenario",
+                "variable",
+                "members_found",
+                "members_written",
+                "members_failed",
+                "rows_written",
+                "output_csv",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print(f"\nWrote extraction summary to: {summary_csv}")
+
+
+if __name__ == "__main__":
+    main()
